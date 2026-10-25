@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+import datetime as dt
+import uuid
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from redis.asyncio import Redis
+
+from app.agents.factory import build_agent
+from app.core.config import Settings
+from app.core.constants import TaskStatus
+from app.models.agent import AgentRun
+from app.models.error import ErrorRecord
+from app.models.task import Task
+from app.orchestrator import model_router
+from app.orchestrator.failure_recovery import classify_error
+from app.orchestrator.llm_clients import build_llm_client, resolve_model_for_tier
+from app.services import event_service, token_service
+
+
+async def _execute_deterministic_task(db: AsyncSession, task: Task) -> None:
+    task.status = TaskStatus.COMPLETED
+    task.completed_at = dt.datetime.utcnow()
+
+
+async def execute_task(db: AsyncSession, redis: Redis | None, settings: Settings, task_id: uuid.UUID) -> None:
+    task_result = await db.execute(select(Task).where(Task.id == task_id))
+    task = task_result.scalars().first()
+    if not task:
+        return
+        
+    task.status = TaskStatus.RUNNING
+    task.started_at = dt.datetime.utcnow()
+    await db.commit()
+    
+    await event_service.publish_event(db, redis, task.project_id, "TASK_STARTED", {"task_id": str(task.id), "title": task.title})
+    
+    try:
+        if task.assigned_agent_type is None:
+            await _execute_deterministic_task(db, task)
+        else:
+            routing = model_router.route_task(task)
+            model_name, provider = resolve_model_for_tier(routing.tier, settings)
+            llm_client = build_llm_client(routing, settings, model_name, provider)
+            
+            agent_run = AgentRun(
+                task_id=task.id,
+                status="running",
+                model_tier=routing.tier,
+                model_used=model_name,
+                started_at=dt.datetime.utcnow()
+            )
+            db.add(agent_run)
+            await db.commit()
+            await db.refresh(agent_run)
+            
+            agent = build_agent(task.assigned_agent_type, llm_client, db, task.project_id, settings)
+            agent_result = await agent.run(task.description)
+            
+            agent_run.status = "completed"
+            agent_run.finished_at = dt.datetime.now(dt.timezone.utc)
+            agent_run.tokens_input = agent_result.usage.input_tokens
+            agent_run.tokens_output = agent_result.usage.output_tokens
+            
+            await token_service.record_usage(
+                db=db,
+                project_id=task.project_id,
+                model_name=model_name,
+                provider=provider,
+                input_tokens=agent_run.tokens_input,
+                output_tokens=agent_run.tokens_output,
+                task_id=task.id,
+                agent_run_id=agent_run.id
+            )
+            
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = dt.datetime.now(dt.timezone.utc)
+
+    except Exception as e:
+        task.status = TaskStatus.FAILED
+        task.completed_at = dt.datetime.now(dt.timezone.utc)
+        
+        category = classify_error(str(e))
+        error_record = ErrorRecord(
+            task_id=task.id,
+            category=category,
+            message=str(e)
+        )
+        db.add(error_record)
+        
+    await db.commit()
+    
+    status_str = task.status.value if hasattr(task.status, "value") else str(task.status)
+    await event_service.publish_event(db, redis, task.project_id, "TASK_COMPLETED" if task.status == TaskStatus.COMPLETED else "TASK_FAILED", {"task_id": str(task.id), "status": status_str})
